@@ -1,0 +1,13 @@
+{
+  "name": "pi-jobs",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Background jobs for Pi: run commands and re-check them on an interval, per session",
+  "pi": { "extensions": ["./index.ts"] },
+  "scripts": {
+    "build:pi": "node ../scripts/build-pi.mjs .",
+    "test": "node --import ../../pi-team/node_modules/tsx/dist/loader.mjs --test tests/*.test.ts",
+    "typecheck": "../../pi-team/node_modules/.bin/tsc --project tsconfig.json"
+  }
+}
