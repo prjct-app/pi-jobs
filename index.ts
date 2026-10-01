@@ -1,7 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Container, Text } from '@earendil-works/pi-tui';
-import { SYMBOL, ago, brand, completer, openForm, openPanel, panelText, row, setMode, type CommandOption, type FormValues, type PanelItem, type PanelSpec, type Tone } from '@prjct.app/pi-tui-kit';
-import { Type } from 'typebox';
+import { SYMBOL, ago, brand, completer, openForm, openPanel, panelText, problemsOf, row, schemaForModel, setMode, type CommandOption, type FormValues, type PanelItem, type PanelSpec, type Tone } from '@prjct.app/pi-tui-kit';
+import { Type, type TSchema } from 'typebox';
+import { Compile } from 'typebox/compile';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { Jobs, MATCH_GAP, MAX_ACTIVE, MIN_EVERY, formatDuration, isActive, parseDuration, specError, wakeText, type Job, type JobSpec, type Wake } from './jobs.ts';
@@ -92,6 +93,43 @@ const watchDraft = (job: Job): Draft => ({
   check: 'Read the error and the lines after it. Find the cause and fix it if it is in this project; otherwise say what is wrong.',
 });
 
+// The model reads the shape of these schemas, nothing more; the limits are
+// checked in execute, against the same schema.
+const startParameters = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 60, description: 'Short label, e.g. "api dev server".' }),
+  command: Type.Optional(Type.String({ minLength: 1, description: 'Shell command, bash -c in its own process group.' })),
+  cwd: Type.Optional(Type.String({ description: 'Working directory; defaults to the session cwd.' })),
+  follow: Type.Optional(Type.String({ description: 'Job id ("j1") whose output this job reads instead of running a command.' })),
+  match: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: 'Case-insensitive regex tested on each new output line.' })),
+  every: Type.Optional(Type.String({ description: 'Wake interval like "5m".' })),
+  check: Type.Optional(Type.String({ maxLength: 2000, description: 'What to do when woken, in plain words. Not a shell command.' })),
+  max_checks: Type.Optional(Type.Integer({ minimum: 1, description: 'End the checks after this many wakes.' })),
+}, { additionalProperties: false });
+const statusParameters = Type.Object({
+  id: Type.Optional(Type.String({ description: 'Job id such as "j2". Omit to list every job.' })),
+  lines: Type.Optional(Type.Integer({ minimum: 1, maximum: 400, description: 'Output lines to show for one job. Default 40.' })),
+}, { additionalProperties: false });
+const restartParameters = Type.Object({
+  id: Type.String({ description: 'Job id such as "j2".' }),
+  command: Type.Optional(Type.String({ minLength: 1, description: 'New shell command; omit to run the same one.' })),
+}, { additionalProperties: false });
+const stopParameters = Type.Object({ id: Type.String({ description: 'Job id such as "j2".' }) }, { additionalProperties: false });
+
+const lazyCompile = <T extends TSchema>(schema: T) => {
+  const slot: { compiled?: { Check(value: unknown): boolean; Errors(value: unknown): Iterable<{ instancePath: string; message: string }> } } = {};
+  return () => (slot.compiled ??= Compile(schema));
+};
+const startValidator = lazyCompile(startParameters);
+const statusValidator = lazyCompile(statusParameters);
+const restartValidator = lazyCompile(restartParameters);
+const stopValidator = lazyCompile(stopParameters);
+
+/** The full schema, limits included, since the model was shown only its shape. */
+const checked = (validator: { Check(value: unknown): boolean; Errors(value: unknown): Iterable<{ instancePath: string; message: string }> }, params: unknown, tool: string): void => {
+  if (validator.Check(params)) return;
+  throw new Error(`Invalid ${tool} arguments: ${problemsOf(validator, params, tool).join('; ')}`);
+};
+
 export default function piJobs(pi: ExtensionAPI): void {
   const state: { jobs?: Jobs; ctx?: ExtensionContext; ticker?: NodeJS.Timeout; off?: () => void } = {};
 
@@ -161,25 +199,16 @@ export default function piJobs(pi: ExtensionAPI): void {
     label: 'Start a background job',
     description: 'Start a background job in this session; you are woken about it only when you are idle. '
       + 'Use it only for work that must keep running while you do other things: a dev server, or a build or test run too long to wait for. '
-      + 'Run anything that finishes in a minute or two with bash instead.\n'
-      + 'command runs detached in its own process group. When it exits you are woken with the exit code and its last output, so never add every just to learn that it finished.\n'
-      + 'A server needs only a command. Do not add every or a check to see that it is still up: a crash wakes you anyway. '
-      + 'To hear about its errors, add match (e.g. "error|exception") and you are woken with each matching line and the lines after it.\n'
-      + `every wakes you on an interval, for something that changes without printing, such as a remote deploy or CI run you re-check yourself. Each wake costs a full turn: use the longest interval that works (minimum ${formatDuration(MIN_EVERY)}). A job that reads output is not woken when nothing new was printed.\n`
-      + 'check is what you do when woken, in plain words for yourself. It is not a shell command.\n'
-      + 'follow reads another job\'s output instead of running a command, so a watcher with its own match, every and check can be stopped without touching the server.\n'
+      + `Run anything that finishes in a minute or two with bash instead. name is a short label; cwd defaults to the session's.\n`
+      + 'command runs detached in its own process group; its exit wakes you with the code and last output, so never add every just to learn that it finished.\n'
+      + `A server needs only a command — no every or check to see that it is still up: a crash wakes you anyway. To hear its errors, add match (e.g. "error|exception") and each matching line wakes you with the lines after it, at most once every ${formatDuration(MATCH_GAP)}.\n`
+      + `every wakes you on an interval, for something that changes without printing (a deploy, a CI run you re-check); omit it for servers. Each wake costs a full turn: use the longest interval that works (minimum ${formatDuration(MIN_EVERY)}). A job that reads output is not woken when nothing new was printed.\n`
+      + 'check is what you do when woken, in plain words for yourself. Not a shell command. It is required when there is neither command nor follow; max_checks ends the checks early.\n'
+      + 'follow reads another job\'s output instead of running a command: a watcher with its own match/every/check, stopped without touching the server.\n'
       + `One job per command: if a job already runs it, use job_restart. At most ${MAX_ACTIVE} active jobs; all end with the session.`,
-    parameters: Type.Object({
-      name: Type.String({ minLength: 1, maxLength: 60, description: 'Short label, e.g. "api dev server" or "deploy staging".' }),
-      command: Type.Optional(Type.String({ minLength: 1, description: 'Shell command run with bash -c in its own process group, e.g. "npm run dev".' })),
-      cwd: Type.Optional(Type.String({ description: 'Working directory; defaults to the session cwd.' })),
-      follow: Type.Optional(Type.String({ description: 'Id of a job with a command (e.g. "j1") whose output this job reads instead of running its own.' })),
-      match: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: `Case-insensitive regular expression tested on each new output line, e.g. "error|exception|failed". A match wakes you with the line and the few after it, at most once every ${formatDuration(MATCH_GAP)}.` })),
-      every: Type.Optional(Type.String({ description: `Wake interval such as "5m" or "1h"; minimum ${formatDuration(MIN_EVERY)}. Omit it for servers and for commands you only need to hear back from when they exit.` })),
-      check: Type.Optional(Type.String({ maxLength: 2000, description: 'What to do when woken, in plain words, e.g. "Find the cause of the error and fix it." Not a shell command. Required for a reminder with neither command nor follow.' })),
-      max_checks: Type.Optional(Type.Integer({ minimum: 1, description: 'End the checks after this many wakes.' })),
-    }, { additionalProperties: false }),
+    parameters: schemaForModel(startParameters, { descriptions: false }),
     execute: async (_id, input, _signal, _onUpdate, ctx) => {
+      checked(startValidator(), input, 'job_start');
       const every = input.every === undefined ? undefined : parseDuration(input.every);
       if (input.every !== undefined && every === undefined) throw new Error(`"${input.every}" is not an interval. Use forms like 5m, 1h, 1h30m.`);
       const cwd = input.cwd ? (isAbsolute(input.cwd) ? input.cwd : resolve(ctx.cwd, input.cwd)) : ctx.cwd;
@@ -206,12 +235,10 @@ export default function piJobs(pi: ExtensionAPI): void {
   pi.registerTool({
     name: 'job_status',
     label: 'Background job status',
-    description: 'List this session\'s background jobs, or show one job with the tail of its output.',
-    parameters: Type.Object({
-      id: Type.Optional(Type.String({ description: 'Job id such as "j2". Omit to list every job.' })),
-      lines: Type.Optional(Type.Integer({ minimum: 1, maximum: 400, description: 'Output lines to show for one job. Default 40.' })),
-    }, { additionalProperties: false }),
+    description: 'List this session\'s background jobs, or show one job with the tail of its output. id names a job; omit it to list all. lines bounds one job\'s output (default 40).',
+    parameters: schemaForModel(statusParameters, { descriptions: false }),
     execute: async (_id, input) => {
+      checked(statusValidator(), input, 'job_status');
       const all = jobs();
       if (input.id) return { content: [{ type: 'text', text: statusText(all.find(input.id), input.lines ?? 40) }], details: undefined };
       const list = all.list();
@@ -226,14 +253,11 @@ export default function piJobs(pi: ExtensionAPI): void {
   pi.registerTool({
     name: 'job_restart',
     label: 'Restart a background job',
-    description: 'Restart a background job in place: same id, and the jobs that follow it keep following. '
-      + 'The old process group is gone before the new one starts, so its port is free. '
-      + 'Use it when a server must pick up something it only reads at start, such as env or config. Give command to replace the command.',
-    parameters: Type.Object({
-      id: Type.String({ description: 'Job id such as "j2".' }),
-      command: Type.Optional(Type.String({ minLength: 1, description: 'New shell command; omit to run the same one.' })),
-    }, { additionalProperties: false }),
+    description: 'Restart a background job in place: same id, followers keep following, and the old process group is gone before the new one starts, so its port is free. '
+      + 'Use it when a server must pick up something it reads only at start (env, config). Give command to replace the command; id names the job.',
+    parameters: schemaForModel(restartParameters, { descriptions: false }),
     execute: async (_id, input) => {
+      checked(restartValidator(), input, 'job_restart');
       const job = await jobs().restart(input.id, 'restarted by the agent', input.command ? { command: input.command } : {});
       return { content: [{ type: 'text', text: `Restarted ${job.id} "${job.name}" (run ${job.runs}).${job.pid ? ` pid ${job.pid}, log ${job.logFile}.` : ''}` }], details: { job: jobView(job) } };
     },
@@ -248,8 +272,9 @@ export default function piJobs(pi: ExtensionAPI): void {
     label: 'Stop a background job',
     description: 'Stop a background job: its process group is terminated, its checks end, and the jobs that follow it stop too. '
       + 'Stop a job as soon as it no longer needs watching; leave a server the person is using running unless they ask.',
-    parameters: Type.Object({ id: Type.String({ description: 'Job id such as "j2".' }) }, { additionalProperties: false }),
+    parameters: schemaForModel(stopParameters, { descriptions: false }),
     execute: async (_id, input) => {
+      checked(stopValidator(), input, 'job_stop');
       const job = jobs().stop(input.id, 'stopped by the agent');
       return { content: [{ type: 'text', text: `${job.id} "${job.name}" · ${meta(job)}.` }], details: undefined };
     },
