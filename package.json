@@ -1,6 +1,6 @@
 {
   "name": "@prjct.app/pi-jobs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Background jobs for Pi: run commands and re-check them on an interval, per session",
   "type": "module",
   "license": "MIT",
@@ -16,27 +16,43 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/prjct-app/pi-local-extensions/main/pi-jobs/docs/cover-v2.png"
   },
   "engines": {
     "node": ">=22.19.0"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/prjct-app/pi-jobs.git"
+    "url": "git+https://github.com/prjct-app/pi-local-extensions.git",
+    "directory": "pi-jobs"
   },
   "bugs": {
-    "url": "https://github.com/prjct-app/pi-jobs/issues"
+    "url": "https://github.com/prjct-app/pi-local-extensions/issues"
   },
-  "homepage": "https://github.com/prjct-app/pi-jobs#readme",
+  "homepage": "https://github.com/prjct-app/pi-local-extensions/tree/main/pi-jobs#readme",
   "files": [
     "README.md",
     "index.ts",
-    "jobs.ts"
+    "jobs.ts",
+    "LICENSE",
+    "docs/cover.png",
+    "docs/cover-v2.png"
   ],
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --import tsx --test tests/*.test.ts"
+    "test": "node --import tsx --test tests/*.test.ts",
+    "check:package": "npm pack --dry-run --ignore-scripts"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@prjct.app/pi-tui-kit": "^0.3.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
 }
