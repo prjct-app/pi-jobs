@@ -1,13 +1,42 @@
 {
-  "name": "pi-jobs",
+  "name": "@prjct.app/pi-jobs",
   "version": "0.1.0",
-  "private": true,
-  "type": "module",
   "description": "Background jobs for Pi: run commands and re-check them on an interval, per session",
-  "pi": { "extensions": ["./index.ts"] },
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "ai-coding",
+    "developer-tools",
+    "jobs",
+    "background-tasks"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/prjct-app/pi-jobs.git"
+  },
+  "bugs": {
+    "url": "https://github.com/prjct-app/pi-jobs/issues"
+  },
+  "homepage": "https://github.com/prjct-app/pi-jobs#readme",
+  "files": [
+    "README.md",
+    "index.ts",
+    "jobs.ts"
+  ],
   "scripts": {
-    "build:pi": "node ../scripts/build-pi.mjs .",
-    "test": "node --import ../../pi-team/node_modules/tsx/dist/loader.mjs --test tests/*.test.ts",
-    "typecheck": "../../pi-team/node_modules/.bin/tsc --project tsconfig.json"
-  }
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts"
+  },
+  "dependencies": {}
 }
