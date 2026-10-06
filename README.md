@@ -1,6 +1,6 @@
 # pi-jobs
 
-[![pi-jobs — for PI Agent](https://raw.githubusercontent.com/prjct-app/pi-local-extensions/main/pi-jobs/docs/cover-v2.png)](https://pi.dev)
+[![pi-jobs — for PI Agent](https://raw.githubusercontent.com/prjct-app/pi-jobs/main/docs/cover-v2.png)](https://pi.dev)
 
 Background jobs for Pi. A job keeps work running while you and the agent do other things, and wakes the agent when that work needs it. Wakes wait until the agent is idle, so they never interrupt a turn.
 
@@ -122,6 +122,6 @@ The agent has four tools: `job_start`, `job_status`, `job_restart` and `job_stop
 - While any job is active, the mode line shows `jobs N`.
 - Logs live in the OS temp dir under `pi-jobs/`. They are deleted with the job or with the session.
 
-Build from `local-extensions`: `node scripts/build-pi.mjs pi-jobs` (or `~/Apps/pi/install-local.sh local-extensions`). Tests: `npm test` here.
+Build this repository with `npm run build:pi`. Tests: `npm test`. Runtime dependencies install from npm automatically.
 
 License: [MIT](LICENSE).
