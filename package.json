@@ -1,6 +1,6 @@
 {
   "name": "@prjct.app/pi-jobs",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Background jobs for Pi: run commands and re-check them on an interval, per session",
   "type": "module",
   "license": "MIT",

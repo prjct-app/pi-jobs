@@ -120,6 +120,17 @@ const lazyCompile = <T extends TSchema>(schema: T) => {
   return () => (slot.compiled ??= Compile(schema));
 };
 const startValidator = lazyCompile(startParameters);
+/** What codemode scripts receive from job_status; the model reads the text. output is the tail of the one job asked for. */
+const statusOutput = Type.Object({
+  jobs: Type.Array(Type.Object({
+    id: Type.String(), name: Type.String(), state: Type.String(), runs: Type.Number(),
+    command: Type.Optional(Type.String()), pid: Type.Optional(Type.Number()), exitCode: Type.Optional(Type.Union([Type.Number(), Type.Null()])), logFile: Type.Optional(Type.String()),
+  })),
+  output: Type.Optional(Type.Array(Type.String())),
+});
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
+const statusRow = ({ id, name, state, runs, command, pid, exitCode, logFile }: Job): { [key: string]: Json } =>
+  ({ id, name, state, runs, ...(command ? { command } : {}), ...(pid === undefined ? {} : { pid }), ...(exitCode === undefined ? {} : { exitCode }), ...(logFile ? { logFile } : {}) });
 const statusValidator = lazyCompile(statusParameters);
 const restartValidator = lazyCompile(restartParameters);
 const stopValidator = lazyCompile(stopParameters);
@@ -237,13 +248,20 @@ export default function piJobs(pi: ExtensionAPI): void {
     label: 'Background job status',
     description: 'List this session\'s background jobs, or show one job with the tail of its output. id names a job; omit it to list all. lines bounds one job\'s output (default 40).',
     parameters: schemaForModel(statusParameters, { descriptions: false }),
+    outputSchema: statusOutput,
     execute: async (_id, input) => {
       checked(statusValidator(), input, 'job_status');
       const all = jobs();
-      if (input.id) return { content: [{ type: 'text', text: statusText(all.find(input.id), input.lines ?? 40) }], details: undefined };
+      if (input.id) {
+        const job = all.find(input.id);
+        const lines = input.lines ?? 40;
+        const structuredContent: { [key: string]: Json } = { jobs: [statusRow(job)], output: job.tail.slice(-lines) };
+        return { content: [{ type: 'text', text: statusText(job, lines) }], structuredContent, details: undefined };
+      }
       const list = all.list();
       const text = list.length ? list.map(job => `${job.id} "${job.name}" · ${meta(job)}`).join('\n') : 'No background jobs in this session.';
-      return { content: [{ type: 'text', text }], details: undefined };
+      const structuredContent: { [key: string]: Json } = { jobs: list.map(statusRow) };
+      return { content: [{ type: 'text', text }], structuredContent, details: undefined };
     },
     renderCall(args, theme) {
       return row(theme, { symbol: SYMBOL.idle, tone: 'muted', verb: 'JOB', target: args?.id ? `status · ${args.id}` : 'status' });
