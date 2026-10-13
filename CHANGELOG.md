@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5 — 2026-10-13
+
+- The manager keeps everything it knows (jobs, process and log handles, partial lines, patterns, flags) in one immutable book that is replaced on every change.
+- A job handed out by `start`, `stop`, `restart`, `due`, etc. never changes afterwards; the newest value comes from `get(id)`.
+- Output capture is a pure function, `takeLines`. Output that arrives after a job was deleted is now dropped instead of being written into a detached object.
+
 ## 0.1.4 — 2026-10-12
 
 - Code: no `let` bindings; mutable state lives in one named object. Behaviour is unchanged.
