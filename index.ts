@@ -532,13 +532,13 @@ export default function piJobs(pi: ExtensionAPI): void {
       const [verb = '', id = ''] = args.trim().split(/\s+/);
       const tui = ctx.hasUI && ctx.mode === 'tui';
       if (verb === 'help') { ctx.ui.notify(HELP, 'info'); return; }
-      let next: Flow['next'];
-      if (verb === 'new') next = { kind: 'new' };
+      const pending = { next: undefined as Flow['next'] };
+      if (verb === 'new') pending.next = { kind: 'new' };
       else if (verb === 'watch') {
         try {
           const job = jobs().find(id);
           if (!job.command) throw new Error(`${id} runs no command to watch.`);
-          next = { kind: 'new', draft: watchDraft(job) };
+          pending.next = { kind: 'new', draft: watchDraft(job) };
         } catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), 'error'); return; }
       } else if (verb) {
         try { ctx.ui.notify(await runVerb(verb, id), 'info'); }
@@ -546,27 +546,25 @@ export default function piJobs(pi: ExtensionAPI): void {
         return;
       }
       if (!tui) {
-        ctx.ui.notify(next ? 'The job form needs the TUI; ask the agent to start the job instead.' : panelText(panel()), next ? 'warning' : 'info');
+        ctx.ui.notify(pending.next ? 'The job form needs the TUI; ask the agent to start the job instead.' : panelText(panel()), pending.next ? 'warning' : 'info');
         return;
       }
       // The form and the panel take turns in the dock: the panel closes to open
       // the form, and opens again on the job the form made or changed.
-      let selected: string | undefined;
+      const view = { selected: undefined as string | undefined, direct: !!pending.next };
       // `/jobs new` cancelled goes back to the editor; a form opened from the panel goes back to the panel.
-      let direct = !!next;
       for (;;) {
+        const next = pending.next;
         if (next) {
-          let made: string | undefined;
-          try { made = await jobForm(ctx, next.kind === 'edit' ? { id: next.id } : { draft: next.draft }); }
-          catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), 'error'); }
-          if (!made && direct) return;
-          direct = false;
-          selected = made ?? (next.kind === 'edit' ? next.id : selected);
+          const made = await jobForm(ctx, next.kind === 'edit' ? { id: next.id } : { draft: next.draft }).catch((error: unknown) => { ctx.ui.notify(error instanceof Error ? error.message : String(error), 'error'); return undefined; });
+          if (!made && view.direct) return;
+          view.direct = false;
+          view.selected = made ?? (next.kind === 'edit' ? next.id : view.selected);
         }
         const flow: Flow = {};
-        await openPanel(ctx, panel(flow, selected));
+        await openPanel(ctx, panel(flow, view.selected));
         if (!flow.next) return;
-        next = flow.next;
+        pending.next = flow.next;
       }
     },
   });

@@ -294,14 +294,14 @@ export class Jobs {
     job.lines += lines.length;
     const pattern = this.patterns.get(job.id);
     if (!pattern || !isActive(job) || job.paused || exhausted(job)) return;
-    let left = this.context.get(job.id) ?? 0;
+    const context = { left: this.context.get(job.id) ?? 0 };
     for (const line of lines) {
-      if (pattern.test(line)) { job.hitCount += 1; job.firstHitAt ??= this.now(); left = CONTEXT; }
-      else if (left > 0) left -= 1;
+      if (pattern.test(line)) { job.hitCount += 1; job.firstHitAt ??= this.now(); context.left = CONTEXT; }
+      else if (context.left > 0) context.left -= 1;
       else continue;
       if (job.hits.length < WAKE_LINES) job.hits.push(line); else job.hitsOmitted += 1;
     }
-    this.context.set(job.id, left);
+    this.context.set(job.id, context.left);
   }
 
   private finish(job: Job, child: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void {
@@ -488,11 +488,11 @@ export class Jobs {
   due(): Wake[] {
     const at = this.now();
     const wakes: Wake[] = [];
-    let touched = false;
+    const changes = { touched: false };
     for (const job of this.list()) {
       const reason = this.reason(job, at);
       if (!reason) continue;
-      touched = true;
+      changes.touched = true;
       // A job that prints nothing new has nothing to check; wait for the next interval.
       if (reason === 'silent') { job.nextCheckAt = at + job.every!; continue; }
       this.forced.delete(job.id);
@@ -519,7 +519,7 @@ export class Jobs {
       if (reason === 'check') job.nextCheckAt = job.every && !job.paused ? at + job.every : undefined;
       this.retire(job, at);
     }
-    if (touched) this.changed();
+    if (changes.touched) this.changed();
     return wakes;
   }
 
