@@ -13,6 +13,8 @@ const until = async (ok: () => boolean, ms = 5_000) => {
     await new Promise(r => setTimeout(r, 20));
   }
 };
+/** Jobs are immutable values: read the newest one by id. */
+const latest = (jobs: Jobs, job: Job): Job => jobs.get(job.id)!;
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 /** A fake clock: the only mutable state in these tests, behind two named operations. */
@@ -49,14 +51,14 @@ test('an exit is reported once, with its new output and a log file', async () =>
   const jobs = new Jobs(logs);
   const job = jobs.start({ name: 'echo', cwd: '/', command: 'echo one; echo two >&2; exit 3' });
   await until(() => jobs.hasDue());
-  assert.equal(job.state, 'failed');
+  assert.equal(latest(jobs, job).state, 'failed');
   const [wake] = jobs.due();
   assert.equal(wake.reason, 'exit');
   assert.deepEqual([...wake.output].sort(), ['one', 'two']);
   assert.match(wakeText([wake]), /exited with code 3/);
   assert.equal(jobs.hasDue(), false);
   assert.deepEqual(jobs.due(), []);
-  assert.match(readFileSync(job.logFile!, 'utf8'), /one/);
+  assert.match(readFileSync(latest(jobs, job).logFile!, 'utf8'), /one/);
   jobs.dispose();
   assert.equal(existsSync(logs), false);
 });
@@ -65,17 +67,17 @@ test('checks come due on the interval and report only new output', () => {
   const clock = createClock(1_000_000);
   const jobs = new Jobs(dir(), () => clock.now());
   const job = jobs.start({ name: 'deploy', cwd: '/', every: 60_000, check: 'Is it green?', maxChecks: 2 });
-  assert.equal(job.state, 'waiting');
+  assert.equal(latest(jobs, job).state, 'waiting');
   assert.equal(jobs.hasDue(), false);
   clock.advance(60_000);
   const [first] = jobs.due();
   assert.equal(first.reason, 'check');
-  assert.equal(job.checks, 1);
+  assert.equal(latest(jobs, job).checks, 1);
   assert.match(wakeText([first], clock.now()), /check 1 of 2[\s\S]*Check: Is it green\?[\s\S]*Next check in 1m/);
   assert.equal(jobs.hasDue(), false);
   clock.advance(60_000);
   assert.equal(jobs.due().length, 1);
-  assert.equal(job.state, 'done');
+  assert.equal(latest(jobs, job).state, 'done');
   clock.advance(600_000);
   assert.equal(jobs.hasDue(), false);
   jobs.dispose();
@@ -85,14 +87,14 @@ test('a command that prints nothing new does not wake the agent on its interval'
   const clock = createClock(0);
   const jobs = new Jobs(dir(), () => clock.now());
   const job = jobs.start({ name: 'server', cwd: '/', command: 'echo listening; sleep 30', every: 60_000, check: 'look' });
-  await until(() => job.lines === 1);
+  await until(() => latest(jobs, job).lines === 1);
   clock.advance(60_000);
   const [first] = jobs.due();
   assert.deepEqual(first.output, ['listening']);
   clock.advance(60_000);
   assert.deepEqual(jobs.due(), [], 'silent: nothing to report');
-  assert.equal(job.checks, 1);
-  assert.equal(job.nextCheckAt, clock.now() + 60_000);
+  assert.equal(latest(jobs, job).checks, 1);
+  assert.equal(latest(jobs, job).nextCheckAt, clock.now() + 60_000);
   // A check the person asks for still arrives, and it does not repeat old output.
   jobs.checkNow(job.id);
   const [forced] = jobs.due();
@@ -114,7 +116,7 @@ test('a matching line wakes the agent with the lines after it, at most once per 
   const clock = createClock(0);
   const jobs = new Jobs(dir(), () => clock.now());
   const job = jobs.start({ name: 'dev', cwd: '/', command: 'echo ready; echo "Error: boom"; echo "  at handler"; sleep 0.4; echo "error two"; sleep 30', match: 'error', check: 'Fix it.' });
-  await until(() => job.hitCount === 1 && job.hits.length === 2);
+  await until(() => latest(jobs, job).hitCount === 1 && latest(jobs, job).hits.length === 2);
   assert.equal(jobs.hasDue(), false, 'waits for the lines that follow');
   clock.advance(2_000);
   const [wake] = jobs.due();
@@ -122,13 +124,13 @@ test('a matching line wakes the agent with the lines after it, at most once per 
   assert.equal(wake.matched, 1);
   assert.deepEqual(wake.output, ['Error: boom', '  at handler']);
   assert.match(wakeText([wake], clock.now()), /1 new line matched \/error\/[\s\S]*Error: boom[\s\S]*Check: Fix it\.[\s\S]*at most every 30s/);
-  await until(() => job.hitCount === 1);
+  await until(() => latest(jobs, job).hitCount === 1);
   clock.advance(2_000);
   assert.equal(jobs.hasDue(), false, 'the gap holds the next match');
   clock.advance(MATCH_GAP);
   const [next] = jobs.due();
   assert.deepEqual(next.output, ['error two']);
-  assert.equal(job.checks, 2);
+  assert.equal(latest(jobs, job).checks, 2);
   jobs.dispose();
 });
 
@@ -137,16 +139,16 @@ test('a watcher follows another job, and stops when that job is deleted', async 
   const jobs = new Jobs(dir(), () => clock.now());
   const server = jobs.start({ name: 'dev server', cwd: '/', command: 'sleep 0.3; echo "TypeError: x is undefined"; sleep 30' });
   const watcher = jobs.start({ name: 'dev errors', cwd: '/', follow: server.id, match: 'error|exception', check: 'Find the cause and fix it.' });
-  assert.equal(watcher.state, 'waiting');
-  await until(() => watcher.hitCount === 1);
+  assert.equal(latest(jobs, watcher).state, 'waiting');
+  await until(() => latest(jobs, watcher).hitCount === 1);
   clock.advance(2_000);
   const wakes = jobs.due();
   assert.deepEqual(wakes.map(w => w.job.id), [watcher.id], 'only the watcher wakes; the server has no checks');
   assert.match(wakeText(wakes, clock.now()), /follows the output of j1 "dev server"[\s\S]*TypeError/);
   assert.throws(() => jobs.start({ name: 'x', cwd: '/', follow: watcher.id, match: 'e' }), /runs no command/);
   jobs.remove(server.id);
-  assert.equal(watcher.state, 'stopped');
-  assert.equal(watcher.history[0]!.text, 'j1 was deleted');
+  assert.equal(latest(jobs, watcher).state, 'stopped');
+  assert.equal(latest(jobs, watcher).history[0]!.text, 'j1 was deleted');
   assert.throws(() => jobs.find(server.id), /j1 was deleted from \/jobs/);
   jobs.dispose();
 });
@@ -163,30 +165,31 @@ test('restart keeps the id and its watchers, and the old process is gone first',
   const jobs = new Jobs(dir());
   const server = jobs.start({ name: 'server', cwd: '/', command: 'echo first; sleep 30' });
   const watcher = jobs.start({ name: 'errors', cwd: '/', follow: server.id, match: 'error' });
-  await until(() => server.lines === 1);
-  const old = server.pid!;
+  await until(() => latest(jobs, server).lines === 1);
+  const old = latest(jobs, server).pid!;
   const again = await jobs.restart(server.id, 'restarted by you', { command: 'echo second; sleep 30' });
-  assert.equal(again, server);
+  assert.equal(again.id, server.id);
+  assert.equal(again, latest(jobs, server), 'restart returns the job as it is now');
   assert.equal(alive(old), false);
-  assert.equal(server.state, 'running');
-  assert.equal(server.runs, 2);
-  assert.notEqual(server.pid, old);
-  await until(() => server.lines === 1);
-  assert.deepEqual(server.tail, ['second']);
-  assert.equal(watcher.state, 'waiting', 'the watcher keeps following');
-  assert.equal(server.history[0]!.text, 'restarted by you');
+  assert.equal(latest(jobs, server).state, 'running');
+  assert.equal(latest(jobs, server).runs, 2);
+  assert.notEqual(latest(jobs, server).pid, old);
+  await until(() => latest(jobs, server).lines === 1);
+  assert.deepEqual(latest(jobs, server).tail, ['second']);
+  assert.equal(latest(jobs, watcher).state, 'waiting', 'the watcher keeps following');
+  assert.equal(latest(jobs, server).history[0]!.text, 'restarted by you');
   jobs.dispose();
 });
 
 test('a finished job restarts as a new run', async () => {
   const jobs = new Jobs(dir());
   const job = jobs.start({ name: 'build', cwd: '/', command: 'exit 1' });
-  await until(() => job.state === 'failed');
+  await until(() => latest(jobs, job).state === 'failed');
   jobs.due();
   await jobs.restart(job.id);
-  assert.equal(job.state, 'running');
-  assert.equal(job.exitCode, undefined);
-  await until(() => job.state === 'failed');
+  assert.equal(latest(jobs, job).state, 'running');
+  assert.equal(latest(jobs, job).exitCode, undefined);
+  await until(() => latest(jobs, job).state === 'failed');
   jobs.dispose();
 });
 
@@ -198,8 +201,8 @@ test('pause holds checks; resume starts the interval again', () => {
   clock.advance(600_000);
   assert.equal(jobs.hasDue(), false);
   jobs.resume(job.id);
-  assert.equal(job.nextCheckAt, clock.now() + 60_000);
-  assert.deepEqual(job.history.slice(0, 2).map(h => h.text), ['checks resumed', 'checks paused']);
+  assert.equal(latest(jobs, job).nextCheckAt, clock.now() + 60_000);
+  assert.deepEqual(latest(jobs, job).history.slice(0, 2).map(h => h.text), ['checks resumed', 'checks paused']);
   jobs.dispose();
 });
 
@@ -208,23 +211,23 @@ test('edit changes how a running job is watched without touching it', () => {
   const jobs = new Jobs(dir(), () => clock.now());
   const job = jobs.start({ name: 'r', cwd: '/', every: 60_000, check: 'look' });
   jobs.edit(job.id, { every: 300_000, name: 'slower' });
-  assert.equal(job.nextCheckAt, 300_000);
-  assert.equal(job.name, 'slower');
+  assert.equal(latest(jobs, job).nextCheckAt, 300_000);
+  assert.equal(latest(jobs, job).name, 'slower');
   assert.throws(() => jobs.edit(job.id, { every: 10_000 }), /at most every/);
   clock.advance(300_000);
   jobs.due();
   jobs.edit(job.id, { maxChecks: 1 });
-  assert.equal(job.state, 'done', 'no checks left');
+  assert.equal(latest(jobs, job).state, 'done', 'no checks left');
   jobs.dispose();
 });
 
 test('stop kills the whole process group and reports nothing', async () => {
   const jobs = new Jobs(dir());
   const job: Job = jobs.start({ name: 'sleep', cwd: '/', command: 'sleep 30 & sleep 30; wait', every: 60_000 });
-  await until(() => job.pid !== undefined);
-  const pid = job.pid!;
+  await until(() => latest(jobs, job).pid !== undefined);
+  const pid = latest(jobs, job).pid!;
   jobs.stop(job.id);
-  assert.equal(job.state, 'stopped');
+  assert.equal(latest(jobs, job).state, 'stopped');
   await until(() => !alive(pid));
   assert.equal(jobs.hasDue(), false);
   assert.equal(jobs.active().length, 0);
@@ -234,14 +237,14 @@ test('stop kills the whole process group and reports nothing', async () => {
 test('stop all ends every active job; purge deletes the finished ones the agent has heard about', async () => {
   const jobs = new Jobs(dir());
   const quick = jobs.start({ name: 'quick', cwd: '/', command: 'echo done' });
-  await until(() => quick.state === 'done');
+  await until(() => latest(jobs, quick).state === 'done');
   assert.deepEqual(jobs.purgeable(), [], 'its exit has not reached the agent yet');
   jobs.due();
   const a = jobs.start({ name: 'a', cwd: '/', command: 'sleep 30' });
   const b = jobs.start({ name: 'b', cwd: '/', every: 60_000, check: 'look' });
   assert.deepEqual(jobs.stopAll('stopped by you').map(j => j.id), [a.id, b.id]);
   assert.equal(jobs.active().length, 0);
-  const log = quick.logFile!;
+  const log = latest(jobs, quick).logFile!;
   assert.deepEqual(jobs.purge().map(j => j.id), [quick.id, a.id, b.id]);
   assert.equal(jobs.list().length, 0);
   assert.equal(existsSync(log), false);
@@ -252,7 +255,7 @@ test('purge keeps a finished job that an active watcher still follows', async ()
   const jobs = new Jobs(dir());
   const server = jobs.start({ name: 'server', cwd: '/', command: 'exit 1' });
   jobs.start({ name: 'errors', cwd: '/', follow: server.id, match: 'error' });
-  await until(() => server.state === 'failed');
+  await until(() => latest(jobs, server).state === 'failed');
   jobs.due();
   assert.deepEqual(jobs.purge(), []);
   jobs.dispose();
@@ -274,8 +277,21 @@ test('a job the person started says so to the agent', () => {
   assert.equal(specError({ every: 60_000 }), 'A reminder without a command needs a check instruction.');
   assert.equal(specError({ command: 'true' }), undefined);
   const job = jobs.start({ name: 'deploy', cwd: '/', every: 60_000, check: 'Is it green?', origin: 'person' });
-  assert.equal(job.history[0]!.text, 'started by you');
+  assert.equal(latest(jobs, job).history[0]!.text, 'started by you');
   clock.advance(60_000);
   assert.match(wakeText(jobs.due(), clock.now()), /The person started this job from \/jobs\./);
+  jobs.dispose();
+});
+
+test('a job handed out never changes; the manager returns a new value instead', () => {
+  const clock = createClock(0);
+  const jobs = new Jobs(dir(), () => clock.now());
+  const job = jobs.start({ name: 'r', cwd: '/', every: 60_000, check: 'look' });
+  const paused = jobs.pause(job.id);
+  assert.equal(job.paused, false);
+  assert.equal(paused.paused, true);
+  assert.equal(job.history.length, 1);
+  assert.equal(paused.history[0]!.text, 'checks paused');
+  assert.equal(jobs.get(job.id), paused);
   jobs.dispose();
 });

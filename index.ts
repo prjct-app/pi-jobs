@@ -360,10 +360,11 @@ export default function piJobs(pi: ExtensionAPI): void {
         { label: 'started', value: ago(job.startedAt) },
         ...(job.logFile ? [{ label: 'log', value: job.logFile }] : []),
       ];
-      const sections: { title: string; lines: string[] }[] = [];
-      if (job.hits.length) sections.push({ title: `Matched, not yet reported · ${plural(job.hitCount, 'line')}`, lines: job.hits });
-      if (job.command || job.follow) sections.push({ title: `${job.follow ? `Output of ${job.follow}` : 'Output'} · ${job.lines} lines`, lines: job.tail.length ? job.tail.slice(-60) : ['(no output yet)'] });
-      sections.push({ title: 'History', lines: job.history.map(entry => `${ago(entry.at)}  ${entry.text}`) });
+      const sections = [
+        ...(job.hits.length ? [{ title: `Matched, not yet reported · ${plural(job.hitCount, 'line')}`, lines: [...job.hits] }] : []),
+        ...(job.command || job.follow ? [{ title: `${job.follow ? `Output of ${job.follow}` : 'Output'} · ${job.lines} lines`, lines: job.tail.length ? job.tail.slice(-60) : ['(no output yet)'] }] : []),
+        { title: 'History', lines: job.history.map(entry => `${ago(entry.at)}  ${entry.text}`) },
+      ];
       return { title: job.name, subtitle: look(job).word, subtitleTone: look(job).tone, fields, sections };
     },
     actions: [
