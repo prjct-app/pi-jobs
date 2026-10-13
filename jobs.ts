@@ -22,7 +22,7 @@ export type JobSpec = {
   origin?: 'agent' | 'person';
 };
 
-export type Job = JobSpec & {
+export type Job = Readonly<JobSpec & {
   id: string;
   state: JobState;
   startedAt: number;
@@ -39,7 +39,7 @@ export type Job = JobSpec & {
   /** 1 for the first run; each restart adds one. */
   runs: number;
   /** Last lines of output, oldest first. */
-  tail: string[];
+  tail: readonly string[];
   /** Every line the job has written, including those no longer in `tail`. */
   lines: number;
   /** `lines` at the last report to the agent. */
@@ -47,29 +47,30 @@ export type Job = JobSpec & {
   /** An exit the agent has not been told about. */
   exitPending: boolean;
   /** Lines that matched, each with the lines after it, not yet reported. At most WAKE_LINES. */
-  hits: string[];
+  hits: readonly string[];
   /** Matching lines not yet reported, including those past the `hits` cap. */
   hitCount: number;
   /** Captured lines that did not fit in `hits`. */
   hitsOmitted: number;
   firstHitAt?: number;
   lastMatchAt?: number;
-  history: { at: number; text: string }[];
-};
+  /** Newest first. */
+  history: readonly Readonly<{ at: number; text: string }>[];
+}>;
 
 /** One reason to wake the agent about one job. */
-export type Wake = {
+export type Wake = Readonly<{
   job: Job;
   reason: 'check' | 'match' | 'exit';
   /** Matching lines when there are any, otherwise the new lines since the last report. At most WAKE_LINES. */
-  output: string[];
+  output: readonly string[];
   /** Lines not included in `output`. */
   omitted: number;
   /** Matching lines behind this wake; 0 when `output` is plain new output. */
   matched: number;
   /** The job a watcher follows. */
   source?: Pick<Job, 'id' | 'name' | 'logFile'>;
-};
+}>;
 
 export const MAX_ACTIVE = 10;
 /** Every wake is a full turn of the model, so checks are at most once a minute. */
@@ -125,29 +126,74 @@ export function specError(spec: Pick<JobSpec, 'command' | 'follow' | 'every' | '
   return undefined;
 }
 
+const NO_HITS = { hits: [], hitCount: 0, hitsOmitted: 0, firstHitAt: undefined } as const satisfies Partial<Job>;
+
+/** The job with a line added to its history, newest first. */
+const noted = (job: Job, at: number, text: string): Job => ({ ...job, history: [{ at, text }, ...job.history] });
+
+const captured = (job: Job, line: string): Job =>
+  job.hits.length < WAKE_LINES ? { ...job, hits: [...job.hits, line] } : { ...job, hitsOmitted: job.hitsOmitted + 1 };
+
+/**
+ * The job after new output lines: the tail and line count grow, and lines that match the pattern
+ * (with the CONTEXT lines after each) are captured. `left` is how many context lines are still owed.
+ */
+export function takeLines(job: Job, lines: readonly string[], pattern: RegExp | undefined, left: number, now: number): Readonly<{ job: Job; left: number }> {
+  const counted: Job = { ...job, tail: [...job.tail, ...lines].slice(-TAIL), lines: job.lines + lines.length };
+  if (!pattern || !isActive(job) || job.paused || exhausted(job)) return { job: counted, left };
+  return lines.reduce<Readonly<{ job: Job; left: number }>>((acc, line) => {
+    if (pattern.test(line)) return { job: captured({ ...acc.job, hitCount: acc.job.hitCount + 1, firstHitAt: acc.job.firstHitAt ?? now }, line), left: CONTEXT };
+    if (acc.left > 0) return { job: captured(acc.job, line), left: acc.left - 1 };
+    return acc;
+  }, { job: counted, left });
+}
+
+const setIn = <K, V>(map: ReadonlyMap<K, V>, key: K, value: V): ReadonlyMap<K, V> => new Map([...map, [key, value]]);
+const without = <K, V>(map: ReadonlyMap<K, V>, key: K): ReadonlyMap<K, V> => new Map([...map].filter(([each]) => each !== key));
+const plus = <T>(set: ReadonlySet<T>, value: T): ReadonlySet<T> => new Set([...set, value]);
+const minus = <T>(set: ReadonlySet<T>, value: T): ReadonlySet<T> => new Set([...set].filter(each => each !== value));
+
+/** Everything the manager knows, as one immutable value. Processes and log streams are handles it points to. */
+type Book = Readonly<{
+  jobs: ReadonlyMap<string, Job>;
+  children: ReadonlyMap<string, ChildProcess>;
+  logs: ReadonlyMap<string, WriteStream>;
+  /** An output line not finished yet, per job. */
+  partial: ReadonlyMap<string, string>;
+  patterns: ReadonlyMap<string, RegExp>;
+  /** Lines still to capture after the last matching line, per job. */
+  context: ReadonlyMap<string, number>;
+  listeners: ReadonlySet<() => void>;
+  forced: ReadonlySet<string>;
+  removed: ReadonlySet<string>;
+  restarting: ReadonlySet<string>;
+  counter: number;
+  disposed: boolean;
+}>;
+
+const EMPTY_BOOK: Book = {
+  jobs: new Map(), children: new Map(), logs: new Map(), partial: new Map(), patterns: new Map(), context: new Map(),
+  listeners: new Set(), forced: new Set(), removed: new Set(), restarting: new Set(), counter: 0, disposed: false,
+};
+
 /**
  * The jobs of one session. Owns their processes and logs; knows nothing about
  * Pi. The extension asks `due()` what to tell the agent when it is idle.
+ * Jobs are immutable values: every change replaces the job, so a job handed out never changes later.
  */
 export class Jobs {
-  private readonly jobs = new Map<string, Job>();
-  private readonly children = new Map<string, ChildProcess>();
-  private readonly logs = new Map<string, WriteStream>();
-  private readonly partial = new Map<string, string>();
-  private readonly patterns = new Map<string, RegExp>();
-  /** Lines still to capture after the last matching line, per job. */
-  private readonly context = new Map<string, number>();
-  private readonly listeners = new Set<() => void>();
-  private readonly forced = new Set<string>();
-  private readonly removed = new Set<string>();
-  private readonly restarting = new Set<string>();
-  private counter = 0;
-  private disposed = false;
+  // The one field that changes: it holds the current book, which is always replaced, never edited.
+  private book: Book = EMPTY_BOOK;
 
   constructor(private readonly logDir: string, private readonly now: () => number = Date.now) {}
 
-  list(): Job[] { return [...this.jobs.values()]; }
-  get(id: string): Job | undefined { return this.jobs.get(id); }
+  private with(change: Partial<Book>): void { this.book = { ...this.book, ...change }; }
+  private put(job: Job): void { this.with({ jobs: setIn(this.book.jobs, job.id, job) }); }
+  /** A job known to exist. */
+  private current(id: string): Job { return this.book.jobs.get(id)!; }
+
+  list(): Job[] { return [...this.book.jobs.values()]; }
+  get(id: string): Job | undefined { return this.book.jobs.get(id); }
   active(): Job[] { return this.list().filter(isActive); }
   /** Active jobs that read this job's output. */
   followers(id: string): Job[] { return this.active().filter(job => job.follow === id); }
@@ -157,23 +203,26 @@ export class Jobs {
   }
 
   onChange(listener: () => void): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+    this.with({ listeners: plus(this.book.listeners, listener) });
+    return () => this.with({ listeners: minus(this.book.listeners, listener) });
   }
 
   /** The job, or an error that says whether it ever existed. */
   find(id: string): Job {
-    const job = this.jobs.get(id);
+    const job = this.book.jobs.get(id);
     if (job) return job;
-    if (this.removed.has(id)) throw new Error(`${id} was deleted from /jobs.`);
+    if (this.book.removed.has(id)) throw new Error(`${id} was deleted from /jobs.`);
     throw new Error(`No job ${id}. Jobs: ${this.list().map(each => each.id).join(', ') || 'none'}.`);
   }
 
   start(spec: JobSpec): Job {
     this.admit(spec);
-    const job: Job = {
+    const counter = this.book.counter + 1;
+    const id = `j${counter}`;
+    this.with({ counter });
+    this.put({
       ...spec,
-      id: `j${++this.counter}`,
+      id,
       state: 'waiting',
       startedAt: 0,
       checks: 0,
@@ -183,45 +232,44 @@ export class Jobs {
       lines: 0,
       reported: 0,
       exitPending: false,
-      hits: [],
-      hitCount: 0,
-      hitsOmitted: 0,
+      ...NO_HITS,
       history: [],
-    };
-    this.jobs.set(job.id, job);
-    this.launch(job, spec.origin === 'person' ? 'started by you' : 'started');
+    });
+    this.launch(id, spec.origin === 'person' ? 'started by you' : 'started');
     this.changed();
-    return job;
+    return this.current(id);
   }
 
   /** Why the spec cannot run now, for a new job or for job `selfId` running again; undefined when it can. */
   whyNot(spec: JobSpec, selfId?: string): string | undefined {
-    try { this.admit(spec, selfId ? this.jobs.get(selfId) : undefined); return undefined; }
+    try { this.admit(spec, selfId ? this.book.jobs.get(selfId) : undefined); return undefined; }
     catch (error) { return error instanceof Error ? error.message : String(error); }
   }
 
   /** Throws when the spec cannot run now, for a new job or for `self` restarting. */
   private admit(spec: JobSpec, self?: Job): void {
-    if (this.disposed) throw new Error('This session has ended.');
+    if (this.book.disposed) throw new Error('This session has ended.');
     const invalid = specError(spec);
     if (invalid) throw new Error(invalid);
     if (spec.follow) {
-      const source = this.jobs.get(spec.follow);
+      const source = this.book.jobs.get(spec.follow);
       if (!source) throw new Error(`No job ${spec.follow} to follow.`);
-      if (source === self) throw new Error('A job cannot follow itself.');
+      if (source.id === self?.id) throw new Error('A job cannot follow itself.');
       if (!source.command) throw new Error(`${source.id} runs no command, so it has no output to follow.`);
     }
     if (spec.command) {
-      const same = this.active().find(job => job !== self && job.command === spec.command && job.cwd === spec.cwd);
+      const same = this.active().find(job => job.id !== self?.id && job.command === spec.command && job.cwd === spec.cwd);
       if (same) throw new Error(`${same.id} "${same.name}" already runs this command. Restart it instead of starting another.`);
     }
     if ((!self || !isActive(self)) && this.active().length >= MAX_ACTIVE) throw new Error(`${MAX_ACTIVE} jobs are already active. Stop one first.`);
   }
 
   /** Begin a run: fresh counters and output, then the process when there is a command. */
-  private launch(job: Job, why: string): void {
+  private launch(id: string, why: string): void {
     const at = this.now();
-    Object.assign(job, {
+    const job = this.current(id);
+    const fresh = noted({
+      ...job,
       state: job.command ? 'running' : 'waiting',
       startedAt: at,
       endedAt: undefined,
@@ -236,106 +284,89 @@ export class Jobs {
       lines: 0,
       reported: 0,
       exitPending: false,
-    } satisfies Partial<Job>);
-    this.clearHits(job);
-    this.forced.delete(job.id);
-    this.partial.delete(job.id);
-    this.setPattern(job);
-    job.history.unshift({ at, text: why });
-    if (job.command) this.spawn(job, job.command);
-    else if (job.logFile) { rmSync(job.logFile, { force: true }); job.logFile = undefined; }
+      ...NO_HITS,
+    }, at, why);
+    this.put(fresh);
+    this.with({ context: without(this.book.context, id), forced: minus(this.book.forced, id), partial: without(this.book.partial, id) });
+    this.setPattern(fresh);
+    if (fresh.command) this.spawn(id, fresh.command);
+    else if (fresh.logFile) { rmSync(fresh.logFile, { force: true }); this.put({ ...fresh, logFile: undefined }); }
   }
 
   private setPattern(job: Job): void {
-    if (job.match) this.patterns.set(job.id, new RegExp(job.match, 'i'));
-    else this.patterns.delete(job.id);
+    this.with({ patterns: job.match ? setIn(this.book.patterns, job.id, new RegExp(job.match, 'i')) : without(this.book.patterns, job.id) });
   }
 
-  private clearHits(job: Job): void {
-    job.hits = [];
-    job.hitCount = 0;
-    job.hitsOmitted = 0;
-    job.firstHitAt = undefined;
-    this.context.delete(job.id);
+  private clearHits(id: string): void {
+    this.put({ ...this.current(id), ...NO_HITS });
+    this.with({ context: without(this.book.context, id) });
   }
 
-  private spawn(job: Job, command: string): void {
+  private spawn(id: string, command: string): void {
     mkdirSync(this.logDir, { recursive: true });
-    job.logFile = join(this.logDir, `${job.id}.log`);
+    const logFile = join(this.logDir, `${id}.log`);
     // Opened now, so a session that ends at once cannot race the lazy open.
-    const log = createWriteStream(job.logFile, { fd: openSync(job.logFile, 'w') });
+    const log = createWriteStream(logFile, { fd: openSync(logFile, 'w') });
     log.on('error', () => { /* the log is a convenience; output also stays in memory */ });
-    this.logs.set(job.id, log);
     // Its own process group, so stopping it also stops what it started.
-    const child = spawn('bash', ['-c', command], { cwd: job.cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
-    job.pid = child.pid;
-    this.children.set(job.id, child);
-    const take = (chunk: Buffer) => { log.write(chunk); this.append(job, chunk.toString('utf8')); };
+    const child = spawn('bash', ['-c', command], { cwd: this.current(id).cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
+    this.put({ ...this.current(id), logFile, pid: child.pid });
+    this.with({ logs: setIn(this.book.logs, id, log), children: setIn(this.book.children, id, child) });
+    const take = (chunk: Buffer) => { log.write(chunk); this.append(id, chunk.toString('utf8')); };
     child.stdout?.on('data', take);
     child.stderr?.on('data', take);
-    child.on('error', error => { this.append(job, `${error.message}\n`); this.finish(job, child, 127, null); });
-    child.on('close', (code, signal) => this.finish(job, child, code, signal));
+    child.on('error', error => { this.append(id, `${error.message}\n`); this.finish(id, child, 127, null); });
+    child.on('close', (code, signal) => this.finish(id, child, code, signal));
   }
 
-  private append(job: Job, text: string): void {
-    const pieces = ((this.partial.get(job.id) ?? '') + text).split(/\r?\n/);
-    this.partial.set(job.id, pieces.pop() ?? '');
-    if (!pieces.length) return;
-    const lines = pieces.map(line => line.length > LINE_CHARS ? `${line.slice(0, LINE_CHARS)}…` : line);
-    this.take(job, lines);
-    for (const watcher of this.followers(job.id)) this.take(watcher, lines);
+  private append(id: string, text: string): void {
+    // Output that arrives after the job was deleted has nowhere to go.
+    if (!this.book.jobs.has(id)) return;
+    const pieces = ((this.book.partial.get(id) ?? '') + text).split(/\r?\n/);
+    this.with({ partial: setIn(this.book.partial, id, pieces.at(-1) ?? '') });
+    const complete = pieces.slice(0, -1);
+    if (!complete.length) return;
+    const lines = complete.map(line => line.length > LINE_CHARS ? `${line.slice(0, LINE_CHARS)}…` : line);
+    this.take(id, lines);
+    for (const watcher of this.followers(id)) this.take(watcher.id, lines);
     this.changed();
   }
 
   /** Record output lines, and the ones that match the job's pattern. */
-  private take(job: Job, lines: string[]): void {
-    job.tail.push(...lines);
-    if (job.tail.length > TAIL) job.tail.splice(0, job.tail.length - TAIL);
-    job.lines += lines.length;
-    const pattern = this.patterns.get(job.id);
-    if (!pattern || !isActive(job) || job.paused || exhausted(job)) return;
-    const context = { left: this.context.get(job.id) ?? 0 };
-    for (const line of lines) {
-      if (pattern.test(line)) { job.hitCount += 1; job.firstHitAt ??= this.now(); context.left = CONTEXT; }
-      else if (context.left > 0) context.left -= 1;
-      else continue;
-      if (job.hits.length < WAKE_LINES) job.hits.push(line); else job.hitsOmitted += 1;
-    }
-    this.context.set(job.id, context.left);
+  private take(id: string, lines: readonly string[]): void {
+    const left = this.book.context.get(id) ?? 0;
+    const result = takeLines(this.current(id), lines, this.book.patterns.get(id), left, this.now());
+    this.put(result.job);
+    if (result.left !== left) this.with({ context: setIn(this.book.context, id, result.left) });
   }
 
-  private finish(job: Job, child: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void {
-    if (this.children.get(job.id) !== child) return;
-    this.children.delete(job.id);
-    if (this.partial.get(job.id)) this.append(job, '\n');
-    this.logs.get(job.id)?.end();
-    this.logs.delete(job.id);
-    job.pid = undefined;
-    job.exitCode = code;
-    job.signal = signal;
-    if (job.state === 'running') {
-      job.state = code === 0 ? 'done' : 'failed';
-      job.endedAt = this.now();
-      job.nextCheckAt = undefined;
-      job.exitPending = true;
-      job.history.unshift({ at: job.endedAt, text: signal ? `killed by ${signal}` : `exited ${code}` });
+  private finish(id: string, child: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.book.children.get(id) !== child) return;
+    this.with({ children: without(this.book.children, id) });
+    if (this.book.partial.get(id)) this.append(id, '\n');
+    this.book.logs.get(id)?.end();
+    this.with({ logs: without(this.book.logs, id) });
+    const job = this.book.jobs.get(id);
+    if (job) {
+      const ended: Job = { ...job, pid: undefined, exitCode: code, signal };
+      const at = this.now();
+      this.put(ended.state === 'running'
+        ? noted({ ...ended, state: code === 0 ? 'done' : 'failed', endedAt: at, nextCheckAt: undefined, exitPending: true }, at, signal ? `killed by ${signal}` : `exited ${code}`)
+        : ended);
     }
     this.changed();
   }
 
   /** End a run without a word to history: SIGTERM to its process group, then SIGKILL. */
-  private halt(job: Job): void {
-    job.state = 'stopped';
-    job.endedAt = this.now();
-    job.nextCheckAt = undefined;
-    job.exitPending = false;
-    this.clearHits(job);
-    this.forced.delete(job.id);
-    const child = this.children.get(job.id);
+  private halt(id: string): void {
+    this.put({ ...this.current(id), state: 'stopped', endedAt: this.now(), nextCheckAt: undefined, exitPending: false });
+    this.clearHits(id);
+    this.with({ forced: minus(this.book.forced, id) });
+    const child = this.book.children.get(id);
     if (child?.pid) {
       kill(child.pid, 'SIGTERM');
       const pid = child.pid;
-      setTimeout(() => { if (this.children.get(job.id) === child) kill(pid, 'SIGKILL'); }, KILL_GRACE).unref();
+      setTimeout(() => { if (this.book.children.get(id) === child) kill(pid, 'SIGKILL'); }, KILL_GRACE).unref();
     }
   }
 
@@ -346,18 +377,19 @@ export class Jobs {
   stop(id: string, why = 'stopped'): Job {
     const job = this.find(id);
     if (!isActive(job)) return job;
-    this.halt(job);
-    job.history.unshift({ at: job.endedAt!, text: why });
+    this.halt(id);
+    const stopped = this.current(id);
+    this.put(noted(stopped, stopped.endedAt!, why));
     for (const watcher of this.followers(id)) this.stop(watcher.id, `${id} stopped`);
     this.changed();
-    return job;
+    return this.current(id);
   }
 
-  /** Stop every active job. Returns the ones it stopped. */
+  /** Stop every active job. Returns them as they are once stopped. */
   stopAll(why = 'stopped'): Job[] {
     const going = this.active();
-    for (const job of going) if (isActive(job)) this.stop(job.id, why);
-    return going;
+    for (const job of going) if (isActive(this.current(job.id))) this.stop(job.id, why);
+    return going.map(job => this.current(job.id));
   }
 
   /**
@@ -367,25 +399,26 @@ export class Jobs {
    */
   async restart(id: string, why = 'restarted', changes: Partial<JobSpec> = {}): Promise<Job> {
     const job = this.find(id);
-    if (this.restarting.has(id)) throw new Error(`${id} is already restarting.`);
+    if (this.book.restarting.has(id)) throw new Error(`${id} is already restarting.`);
     const next: JobSpec = { ...job, ...changes };
     this.admit(next, job);
-    this.restarting.add(id);
+    this.with({ restarting: plus(this.book.restarting, id) });
     try {
-      const child = this.children.get(id);
+      const child = this.book.children.get(id);
       if (child) {
-        if (isActive(job)) { this.halt(job); this.changed(); }
+        if (isActive(this.current(id))) { this.halt(id); this.changed(); }
         await this.exited(child);
-        if (this.children.get(id) === child) throw new Error(`${id} did not exit; try again.`);
+        if (this.book.children.get(id) === child) throw new Error(`${id} did not exit; try again.`);
       }
-      if (this.jobs.get(id) !== job) throw new Error(`${id} was deleted while restarting.`);
-      this.admit(next, job);
-      Object.assign(job, changes);
-      this.launch(job, why);
+      const still = this.book.jobs.get(id);
+      if (!still) throw new Error(`${id} was deleted while restarting.`);
+      this.admit(next, still);
+      this.put({ ...still, ...changes });
+      this.launch(id, why);
       this.changed();
-      return job;
+      return this.current(id);
     } finally {
-      this.restarting.delete(id);
+      this.with({ restarting: minus(this.book.restarting, id) });
     }
   }
 
@@ -405,48 +438,52 @@ export class Jobs {
     const invalid = specError({ ...job, ...changes });
     if (invalid) throw new Error(invalid);
     const at = this.now();
-    Object.assign(job, changes);
-    if ('match' in changes) { this.setPattern(job); this.clearHits(job); }
-    if ('every' in changes || 'maxChecks' in changes) job.nextCheckAt = job.every && !job.paused && !exhausted(job) ? at + job.every : undefined;
-    job.history.unshift({ at, text: why });
-    this.retire(job, at);
+    const edited: Job = { ...job, ...changes };
+    this.put(edited);
+    if ('match' in changes) { this.setPattern(edited); this.clearHits(id); }
+    if ('every' in changes || 'maxChecks' in changes) {
+      const current = this.current(id);
+      this.put({ ...current, nextCheckAt: current.every && !current.paused && !exhausted(current) ? at + current.every : undefined });
+    }
+    this.put(noted(this.current(id), at, why));
+    this.retire(id, at);
     this.changed();
-    return job;
+    return this.current(id);
   }
 
   /** Hold checks and matches; the process keeps running and an exit is still reported. */
   pause(id: string): Job {
     const job = this.find(id);
     if (!isActive(job) || job.paused) return job;
-    job.paused = true;
-    job.nextCheckAt = undefined;
-    this.clearHits(job);
-    job.history.unshift({ at: this.now(), text: 'checks paused' });
+    this.put({ ...job, paused: true, nextCheckAt: undefined });
+    this.clearHits(id);
+    this.put(noted(this.current(id), this.now(), 'checks paused'));
     this.changed();
-    return job;
+    return this.current(id);
   }
 
   resume(id: string): Job {
     const job = this.find(id);
     if (!isActive(job) || !job.paused) return job;
     const at = this.now();
-    job.paused = false;
-    job.nextCheckAt = job.every && !exhausted(job) ? at + job.every : undefined;
-    job.history.unshift({ at, text: 'checks resumed' });
+    this.put(noted({ ...job, paused: false, nextCheckAt: job.every && !exhausted(job) ? at + job.every : undefined }, at, 'checks resumed'));
     this.changed();
-    return job;
+    return this.current(id);
   }
 
   /** Delete a job from the list, stopping it first, with its log. Watchers that follow it stop. */
   remove(id: string, why = 'deleted'): Job {
-    const job = this.find(id);
+    this.find(id);
     for (const watcher of this.followers(id)) this.stop(watcher.id, `${id} was deleted`);
-    if (isActive(job)) this.stop(id, why);
-    this.jobs.delete(id);
-    this.removed.add(id);
-    this.forced.delete(id);
-    this.patterns.delete(id);
-    this.context.delete(id);
+    if (isActive(this.current(id))) this.stop(id, why);
+    const job = this.current(id);
+    this.with({
+      jobs: without(this.book.jobs, id),
+      removed: plus(this.book.removed, id),
+      forced: minus(this.book.forced, id),
+      patterns: without(this.book.patterns, id),
+      context: without(this.book.context, id),
+    });
     if (job.logFile) rmSync(job.logFile, { force: true });
     this.changed();
     return job;
@@ -454,16 +491,14 @@ export class Jobs {
 
   /** Delete every finished job whose end the agent has heard about. Returns the ones it deleted. */
   purge(): Job[] {
-    const going = this.purgeable();
-    for (const job of going) this.remove(job.id);
-    return going;
+    return this.purgeable().map(job => this.remove(job.id));
   }
 
   /** Make an active job due now. */
   checkNow(id: string): void {
     const job = this.find(id);
     if (!isActive(job)) return;
-    this.forced.add(id);
+    this.with({ forced: plus(this.book.forced, id) });
     this.changed();
   }
 
@@ -471,7 +506,7 @@ export class Jobs {
   private reason(job: Job, at: number): Wake['reason'] | 'silent' | undefined {
     if (job.exitPending) return 'exit';
     if (!isActive(job)) return undefined;
-    if (this.forced.has(job.id)) return 'check';
+    if (this.book.forced.has(job.id)) return 'check';
     if (job.paused || exhausted(job)) return undefined;
     if (job.hits.length && at - job.firstHitAt! >= SETTLE && at - (job.lastMatchAt ?? -Infinity) >= MATCH_GAP) return 'match';
     if (job.nextCheckAt !== undefined && job.nextCheckAt <= at) return readsOutput(job) && job.lines === job.reported ? 'silent' : 'check';
@@ -487,66 +522,60 @@ export class Jobs {
   /** Take everything the agent should hear about now, and schedule the next checks. */
   due(): Wake[] {
     const at = this.now();
-    const wakes: Wake[] = [];
-    const changes = { touched: false };
-    for (const job of this.list()) {
-      const reason = this.reason(job, at);
-      if (!reason) continue;
-      changes.touched = true;
-      // A job that prints nothing new has nothing to check; wait for the next interval.
-      if (reason === 'silent') { job.nextCheckAt = at + job.every!; continue; }
-      this.forced.delete(job.id);
-      const hits = reason !== 'exit' && job.hits.length > 0;
-      const matched = hits ? job.hitCount : 0;
-      const fresh = job.lines - job.reported;
-      const output = hits ? job.hits : fresh > 0 ? job.tail.slice(-Math.min(fresh, WAKE_LINES)) : [];
-      const source = job.follow ? this.jobs.get(job.follow) : undefined;
-      wakes.push({
-        job,
-        reason,
-        output,
-        omitted: hits ? job.hitsOmitted : Math.max(0, fresh - output.length),
-        matched,
-        source: source && { id: source.id, name: source.name, logFile: source.logFile },
-      });
-      if (hits) job.lastMatchAt = at;
-      job.reported = job.lines;
-      job.exitPending = false;
-      this.clearHits(job);
-      if (reason === 'exit') continue;
-      job.checks += 1;
-      job.history.unshift({ at, text: matched ? `woke on ${plural(matched, 'matching line')}` : `check ${job.checks}` });
-      if (reason === 'check') job.nextCheckAt = job.every && !job.paused ? at + job.every : undefined;
-      this.retire(job, at);
-    }
-    if (changes.touched) this.changed();
+    const due = this.list().filter(job => this.reason(job, at) !== undefined);
+    const wakes = due.flatMap(job => this.wake(job.id, at));
+    if (due.length) this.changed();
     return wakes;
   }
 
+  /** Report one due job: what the agent hears, and the job marked as reported. */
+  private wake(id: string, at: number): Wake[] {
+    const job = this.current(id);
+    const reason = this.reason(job, at);
+    if (!reason) return [];
+    // A job that prints nothing new has nothing to check; wait for the next interval.
+    if (reason === 'silent') { this.put({ ...job, nextCheckAt: at + job.every! }); return []; }
+    this.with({ forced: minus(this.book.forced, id) });
+    const hits = reason !== 'exit' && job.hits.length > 0;
+    const matched = hits ? job.hitCount : 0;
+    const fresh = job.lines - job.reported;
+    const output = hits ? job.hits : fresh > 0 ? job.tail.slice(-Math.min(fresh, WAKE_LINES)) : [];
+    const omitted = hits ? job.hitsOmitted : Math.max(0, fresh - output.length);
+    const source = job.follow ? this.book.jobs.get(job.follow) : undefined;
+    const reported: Job = { ...job, lastMatchAt: hits ? at : job.lastMatchAt, reported: job.lines, exitPending: false };
+    this.put(reported);
+    this.clearHits(id);
+    if (reason !== 'exit') {
+      const current = this.current(id);
+      const checks = current.checks + 1;
+      const nextCheckAt = reason === 'check' ? (current.every && !current.paused ? at + current.every : undefined) : current.nextCheckAt;
+      this.put(noted({ ...current, checks, nextCheckAt }, at, matched ? `woke on ${plural(matched, 'matching line')}` : `check ${checks}`));
+      this.retire(id, at);
+    }
+    return [{ job: this.current(id), reason, output, omitted, matched, source: source && { id: source.id, name: source.name, logFile: source.logFile } }];
+  }
+
   /** A job with nothing left to wake the agent about ends; a command keeps running. */
-  private retire(job: Job, at: number): void {
-    if (!exhausted(job)) return;
-    job.nextCheckAt = undefined;
-    this.clearHits(job);
-    if (!job.command && isActive(job)) { job.state = 'done'; job.endedAt = at; job.history.unshift({ at, text: 'last check done' }); }
+  private retire(id: string, at: number): void {
+    if (!exhausted(this.current(id))) return;
+    this.put({ ...this.current(id), nextCheckAt: undefined });
+    this.clearHits(id);
+    const job = this.current(id);
+    if (!job.command && isActive(job)) this.put(noted({ ...job, state: 'done', endedAt: at }, at, 'last check done'));
   }
 
   /** Kill every process and delete the logs. Idempotent. */
   dispose(): void {
-    if (this.disposed) return;
-    this.disposed = true;
-    for (const [id, child] of this.children) {
-      if (child.pid) kill(child.pid, 'SIGKILL');
-      this.children.delete(id);
-    }
-    for (const log of this.logs.values()) log.end();
-    this.logs.clear();
-    this.listeners.clear();
+    if (this.book.disposed) return;
+    const { children, logs } = this.book;
+    this.with({ disposed: true, children: new Map(), logs: new Map(), listeners: new Set() });
+    for (const child of children.values()) if (child.pid) kill(child.pid, 'SIGKILL');
+    for (const log of logs.values()) log.end();
     rmSync(this.logDir, { recursive: true, force: true });
   }
 
   private changed(): void {
-    for (const listener of this.listeners) listener();
+    for (const listener of this.book.listeners) listener();
   }
 }
 
