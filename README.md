@@ -9,7 +9,7 @@ Jobs belong to the session. Ending the session kills their processes and deletes
 
 ## Install
 
-Requires Pi and Node.js 22.19+. Install the package, then reload Pi:
+Requires Pi and Node.js 22.23.4+. Install the package, then reload Pi:
 
 ```sh
 pi install npm:@prjct.app/pi-jobs
