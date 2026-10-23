@@ -20,7 +20,7 @@
     "image": "https://raw.githubusercontent.com/prjct-app/pi-jobs/main/docs/cover-v2.png"
   },
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.23.4"
   },
   "repository": {
     "type": "git",
