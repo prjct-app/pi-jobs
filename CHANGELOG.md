@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- The npm package no longer ships the cover images. The README and Pi gallery load them from GitHub.
+- Pushing a `v<version>` tag publishes the package from CI with provenance.
 - `job_status` renders as one line: how the job ended or what it is doing, with its run and line count. Expanding shows the command (clipped), the cwd and log, and the output tail. The call row names the job instead of its id. The model still receives the full status text.
 
 ## 0.1.5 — 2026-10-13
