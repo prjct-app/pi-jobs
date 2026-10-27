@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.6 — 2026-10-26
 
 - The npm package no longer ships the cover images. The README and Pi gallery load them from GitHub.
 - Pushing a `v<version>` tag publishes the package from CI with provenance.
