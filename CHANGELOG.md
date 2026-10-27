@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `job_status` renders as one line: how the job ended or what it is doing, with its run and line count. Expanding shows the command (clipped), the cwd and log, and the output tail. The call row names the job instead of its id. The model still receives the full status text.
+
 ## 0.1.5 — 2026-10-13
 
 - The manager keeps everything it knows (jobs, process and log handles, partial lines, patterns, flags) in one immutable book that is replaced on every change.
