@@ -34,9 +34,7 @@
     "README.md",
     "index.ts",
     "jobs.ts",
-    "LICENSE",
-    "docs/cover.png",
-    "docs/cover-v2.png"
+    "LICENSE"
   ],
   "scripts": {
     "check": "tsc --noEmit",
