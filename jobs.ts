@@ -105,7 +105,7 @@ export function formatDuration(ms: number): string {
   return [h && `${h}h`, m && `${m}m`, (s || (!h && !m)) && `${s}s`].filter(Boolean).join('');
 }
 
-export const isActive = (job: Job): boolean => job.state === 'running' || job.state === 'waiting';
+export const isActive = (job: Pick<Job, 'state'>): boolean => job.state === 'running' || job.state === 'waiting';
 
 /** True when the job reads output: its own command's, or the job it follows. */
 const readsOutput = (job: Pick<JobSpec, 'command' | 'follow'>): boolean => !!(job.command || job.follow);

@@ -1,6 +1,6 @@
-import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { keyHint, type ExtensionAPI, type ExtensionContext, type Theme } from '@earendil-works/pi-coding-agent';
 import { Container, Text } from '@earendil-works/pi-tui';
-import { SYMBOL, ago, brand, completer, openForm, openPanel, panelText, problemsOf, row, schemaForModel, setMode, type CommandOption, type FormValues, type PanelItem, type PanelSpec, type Tone } from '@prjct.app/pi-tui-kit';
+import { SYMBOL, ago, brand, paint, completer, openForm, openPanel, panelText, problemsOf, row, schemaForModel, setMode, type CommandOption, type FormValues, type PanelItem, type PanelSpec, type Tone } from '@prjct.app/pi-tui-kit';
 import { Type, type TSchema } from 'typebox';
 import { Compile } from 'typebox/compile';
 import { tmpdir } from 'node:os';
@@ -20,16 +20,21 @@ const LOOK: Record<Job['state'], { symbol: string; tone: Tone; word: string }> =
   stopped: { symbol: SYMBOL.idle, tone: 'dim', word: 'stopped' },
 };
 
-const look = (job: Job) => job.state === 'waiting' && job.follow ? { ...LOOK.waiting, word: `watching ${job.follow}` } : LOOK[job.state];
+const look = (job: Pick<Job, 'state' | 'follow'>) => job.state === 'waiting' && job.follow ? { ...LOOK.waiting, word: `watching ${job.follow}` } : LOOK[job.state];
 
 type JobView = Pick<Job, 'id' | 'name' | 'state' | 'checks' | 'exitCode' | 'signal' | 'pid' | 'logFile'>;
+/** What job_status draws; times are read against the clock when drawn. */
+type StatusView = Pick<Job, 'id' | 'name' | 'state' | 'command' | 'cwd' | 'follow' | 'match' | 'every' | 'paused' | 'nextCheckAt' | 'endedAt' | 'exitCode' | 'signal' | 'logFile' | 'lines' | 'runs'>;
+type StatusDetails = { jobs: StatusView[]; one: boolean };
 type WakeView = { reason: Wake['reason']; matched?: number; job: JobView };
 
 const jobView = ({ id, name, state, checks, exitCode, signal, pid, logFile }: Job): JobView => ({ id, name, state, checks, exitCode, signal, pid, logFile });
+const statusView = ({ id, name, state, command, cwd, follow, match, every, paused, nextCheckAt, endedAt, exitCode, signal, logFile, lines, runs }: Job): StatusView =>
+  ({ id, name, state, command, cwd, follow, match, every, paused, nextCheckAt, endedAt, exitCode, signal, logFile, lines, runs });
 const oneLine = (text: string): string => text.replace(/\s+/g, ' ').trim();
 const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`;
 
-function meta(job: Job, now = Date.now()): string {
+function meta(job: StatusView, now = Date.now()): string {
   if (isActive(job)) {
     const next = job.paused ? 'paused' : job.nextCheckAt ? `next ${formatDuration(Math.max(0, job.nextCheckAt - now))}` : job.match ? 'on match' : '';
     return [look(job).word, next].filter(Boolean).join(' · ');
@@ -47,8 +52,50 @@ function statusText(job: Job, lines: number, now = Date.now()): string {
   if (job.check) out.push(`check: ${job.check}`);
   if (job.logFile) out.push(`log: ${job.logFile} (${job.lines} lines)`);
   const tail = job.tail.slice(-lines);
-  if (tail.length) out.push('output:', ...tail.map(line => `  ${line}`));
+  if (tail.length) out.push(OUTPUT_HEADING, ...tail.map(line => `  ${line}`));
   return out.join('\n');
+}
+
+const OUTPUT_HEADING = 'output:';
+const COMMAND_PREVIEW = 120;
+const clip = (text: string, max: number): string => text.length > max ? `${text.slice(0, max - 1)}…` : text;
+
+/** The output tail statusText wrote, read back so the session does not store it twice. */
+export function outputOf(text: string): string[] {
+  const lines = text.split('\n');
+  const start = lines.indexOf(OUTPUT_HEADING);
+  return start < 0 ? [] : lines.slice(start + 1).map(line => line.replace(/^ {2}/, ''));
+}
+
+/** Collapsed: how the job ended or what it is doing. Expanded: where it runs and its output. */
+export function statusLines(details: StatusDetails, text: string, expanded: boolean, theme: Theme, now = Date.now()): string[] {
+  if (!details.one) {
+    const counts = new Map<string, number>();
+    for (const job of details.jobs) counts.set(look(job).word, (counts.get(look(job).word) ?? 0) + 1);
+    const head = [plural(details.jobs.length, 'job'), ...[...counts].map(([word, n]) => `${n} ${word}`)].join(' · ');
+    if (!details.jobs.length) return [theme.fg('muted', 'no jobs')];
+    if (!expanded) return [theme.fg('muted', head)];
+    return [theme.fg('muted', head), ...details.jobs.map(job => {
+      const { symbol, tone } = look(job);
+      return `${paint(theme, tone, symbol)} ${theme.fg('dim', job.id)} ${job.name} ${theme.fg('dim', `· ${meta(job, now)}`)}`;
+    })];
+  }
+  const [job] = details.jobs;
+  if (!job) return [theme.fg('error', text.split('\n')[0] ?? '')];
+  const { symbol, tone } = look(job);
+  const facts = [meta(job, now), job.runs > 1 ? `run ${job.runs}` : '', job.lines ? plural(job.lines, 'line') : ''].filter(Boolean);
+  const head = `${paint(theme, tone, symbol)} ${theme.fg('muted', facts.join(' · '))}`;
+  if (!expanded) return [head];
+  const output = outputOf(text);
+  const watch = [job.follow ? `follows ${job.follow}` : '', job.match ? `match /${job.match}/` : '', job.every ? `every ${formatDuration(job.every)}` : ''].filter(Boolean);
+  return [
+    head,
+    ...(job.command ? [theme.fg('dim', `$ ${clip(oneLine(job.command), COMMAND_PREVIEW)}`)] : []),
+    ...(watch.length ? [theme.fg('dim', watch.join(' · '))] : []),
+    theme.fg('dim', [`cwd ${job.cwd}`, job.logFile ? `log ${job.logFile}` : ''].filter(Boolean).join(' · ')),
+    ...(output.length ? ['', ...output.map(line => theme.fg('toolOutput', line))] : []),
+    ...(job.lines > output.length && output.length ? [theme.fg('dim', `… ${job.lines - output.length} earlier lines in the log`)] : []),
+  ];
 }
 
 const HELP = [
@@ -256,15 +303,27 @@ export default function piJobs(pi: ExtensionAPI): void {
         const job = all.find(input.id);
         const lines = input.lines ?? 40;
         const structuredContent: { [key: string]: Json } = { jobs: [statusRow(job)], output: job.tail.slice(-lines) };
-        return { content: [{ type: 'text', text: statusText(job, lines) }], structuredContent, details: undefined };
+        const details: StatusDetails = { jobs: [statusView(job)], one: true };
+        return { content: [{ type: 'text', text: statusText(job, lines) }], structuredContent, details };
       }
       const list = all.list();
       const text = list.length ? list.map(job => `${job.id} "${job.name}" · ${meta(job)}`).join('\n') : 'No background jobs in this session.';
       const structuredContent: { [key: string]: Json } = { jobs: list.map(statusRow) };
-      return { content: [{ type: 'text', text }], structuredContent, details: undefined };
+      const details: StatusDetails = { jobs: list.map(statusView), one: false };
+      return { content: [{ type: 'text', text }], structuredContent, details };
     },
     renderCall(args, theme) {
-      return row(theme, { symbol: SYMBOL.idle, tone: 'muted', verb: 'JOB', target: args?.id ? `status · ${args.id}` : 'status' });
+      const job = args?.id ? state.jobs?.get(args.id) : undefined;
+      return row(theme, { symbol: SYMBOL.idle, tone: 'muted', verb: 'JOB', target: args?.id ? `status · ${job ? job.name : args.id}` : 'status' });
+    },
+    renderResult(result, { expanded }, theme) {
+      const text = String((result.content[0] as { text?: string } | undefined)?.text ?? '');
+      const details = result.details as StatusDetails | undefined;
+      if (!details?.jobs) return new Text(theme.fg('error', text.split('\n')[0] ?? ''), 2, 0);
+      const lines = statusLines(details, text, expanded, theme);
+      // A collapsed line hides something whenever there is a job to show.
+      if (!expanded && details.jobs.length) lines[0] += `  ${theme.fg('dim', keyHint('app.tools.expand', 'details'))}`;
+      return new Text(lines.join('\n'), 2, 0);
     },
   });
 
